@@ -7,6 +7,28 @@ let sessionManager: SessionManager;
 let httpServer: HttpServer;
 let statusBarItem: vscode.StatusBarItem;
 
+export function getTargetWorkspaceFromActiveEditor(
+  workspaceFolders: readonly vscode.WorkspaceFolder[] | undefined,
+  activeEditor: vscode.TextEditor | undefined
+): vscode.WorkspaceFolder | undefined {
+  if (!workspaceFolders || workspaceFolders.length === 0) {
+    return undefined;
+  }
+
+  if (activeEditor) {
+    const activeWorkspace = vscode.workspace.getWorkspaceFolder(activeEditor.document.uri);
+    if (activeWorkspace) {
+      return activeWorkspace;
+    }
+  }
+
+  if (workspaceFolders.length === 1) {
+    return workspaceFolders[0];
+  }
+
+  return undefined;
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   sessionManager = new SessionManager();
   httpServer = new HttpServer(sessionManager);
@@ -25,30 +47,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       }
 
-      let targetWorkspace: vscode.WorkspaceFolder | undefined;
-
-      const activeEditor = vscode.window.activeTextEditor;
-      if (activeEditor) {
-        targetWorkspace = vscode.workspace.getWorkspaceFolder(activeEditor.document.uri);
-      }
+      let targetWorkspace = getTargetWorkspaceFromActiveEditor(
+        workspaceFolders,
+        vscode.window.activeTextEditor
+      );
 
       if (!targetWorkspace) {
-        if (workspaceFolders.length === 1) {
-          targetWorkspace = workspaceFolders[0];
-        } else {
-          const picks = workspaceFolders.map(f => ({
-            label: f.name,
-            description: f.uri.fsPath,
-            folder: f,
-          }));
-          const selected = await vscode.window.showQuickPick(picks, {
-            placeHolder: 'Select workspace folder to enable',
-          });
-          if (!selected) {
-            return;
-          }
-          targetWorkspace = selected.folder;
+        const picks = workspaceFolders.map(f => ({
+          label: f.name,
+          description: f.uri.fsPath,
+          folder: f,
+        }));
+        const selected = await vscode.window.showQuickPick(picks, {
+          placeHolder: 'Select workspace folder to enable',
+        });
+        if (!selected) {
+          return;
         }
+        targetWorkspace = selected.folder;
       }
 
       const confirm = await vscode.window.showInformationMessage(

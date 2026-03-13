@@ -6,6 +6,12 @@ export function authenticate(
   res: http.ServerResponse,
   sessionManager: SessionManager
 ): boolean {
+  if (!sessionManager.isEnabled) {
+    res.statusCode = 503;
+    res.end(JSON.stringify({ error: 'Workspace not enabled' }));
+    return false;
+  }
+
   const authHeader = req.headers['authorization'];
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -21,12 +27,6 @@ export function authenticate(
   if (!expectedToken || token !== expectedToken) {
     res.statusCode = 403;
     res.end(JSON.stringify({ error: 'Invalid token' }));
-    return false;
-  }
-
-  if (!sessionManager.isEnabled) {
-    res.statusCode = 503;
-    res.end(JSON.stringify({ error: 'Workspace not enabled' }));
     return false;
   }
 
