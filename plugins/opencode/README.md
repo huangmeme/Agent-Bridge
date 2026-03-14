@@ -21,7 +21,5 @@ This keeps repository source code and local tool wiring separate.
 
 - `AGENT_BRIDGE_HOME`
   - Override the default bridge home directory. Defaults to `~/.agent-bridge`.
-- `AGENT_BRIDGE_CONTEXT_LIMIT`
-  - Maximum injected visible-text character count. Defaults to `12000`.
 - `AGENT_BRIDGE_DIAGNOSTIC_LIMIT`
   - Maximum diagnostics included in summaries. Defaults to `8`.

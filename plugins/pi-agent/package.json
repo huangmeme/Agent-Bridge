@@ -1,0 +1,5 @@
+{
+  "name": "agent-bridge-pi-agent-plugin",
+  "private": true,
+  "type": "module"
+}

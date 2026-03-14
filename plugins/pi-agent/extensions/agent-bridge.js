@@ -7,8 +7,6 @@ const DEFAULT_BRIDGE_HOME = path.join(os.homedir(), ".agent-bridge");
 const DEFAULT_DIAGNOSTIC_LIMIT = 8;
 const DEFAULT_HTTP_TIMEOUT_MS = 1200;
 
-const lspDiagnosticsCache = new Map();
-
 function toPositiveInt(value, fallback) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
@@ -43,7 +41,7 @@ function formatRange(range) {
   return `L${startLine}:C${startChar} - L${endLine}:C${endChar}`;
 }
 
-function formatSelections(snapshot) {
+function formatSelection(snapshot) {
   const primary = snapshot?.primarySelection;
   if (!primary) {
     return "No active selection";
@@ -74,63 +72,24 @@ function summarizeDiagnostics(diagnostics, limit) {
   return lines.join("\n");
 }
 
-function extractDiagnosticsFromEvent(event) {
-  const candidates = [
-    event?.diagnostics,
-    event?.properties?.diagnostics,
-    event?.properties?.params?.diagnostics,
-    event?.properties?.payload?.diagnostics,
-    event?.data?.diagnostics,
-    event?.params?.diagnostics,
-  ];
-
-  for (const candidate of candidates) {
-    if (Array.isArray(candidate)) {
-      return candidate;
-    }
-  }
-
-  return [];
-}
-
-function getEventSessionId(event) {
-  const candidates = [
-    event?.sessionID,
-    event?.sessionId,
-    event?.properties?.sessionID,
-    event?.properties?.sessionId,
-    event?.data?.sessionID,
-    event?.data?.sessionId,
-  ];
-
-  for (const candidate of candidates) {
-    if (typeof candidate === "string" && candidate.length > 0) {
-      return candidate;
-    }
-  }
-
-  return null;
-}
-
-function scoreSessionMatch(session, directory, worktree) {
+function scoreSessionMatch(session, cwd) {
   const workspacePath = safeFileUriToPath(session?.workspaceUri);
-  if (!workspacePath) {
+  if (!workspacePath || !cwd) {
     return -1;
   }
 
   const workspace = normalizePath(workspacePath);
-  const cwd = normalizePath(directory);
-  const tree = normalizePath(worktree);
+  const currentDir = normalizePath(cwd);
 
-  if (workspace === tree) {
+  if (workspace === currentDir) {
     return 300;
   }
 
-  if (cwd.startsWith(`${workspace}${path.sep}`) || cwd === workspace) {
+  if (currentDir.startsWith(`${workspace}${path.sep}`)) {
     return 250;
   }
 
-  if (tree.startsWith(`${workspace}${path.sep}`) || workspace.startsWith(`${tree}${path.sep}`)) {
+  if (workspace.startsWith(`${currentDir}${path.sep}`)) {
     return 200;
   }
 
@@ -149,7 +108,7 @@ async function loadSessions(bridgeHome) {
   }
 }
 
-async function resolveSession({ directory, worktree, bridgeHome }) {
+async function resolveSession({ cwd, bridgeHome }) {
   const sessions = await loadSessions(bridgeHome);
   if (sessions.length === 0) {
     return null;
@@ -158,7 +117,7 @@ async function resolveSession({ directory, worktree, bridgeHome }) {
   const ranked = sessions
     .map((session) => ({
       session,
-      score: scoreSessionMatch(session, directory, worktree),
+      score: scoreSessionMatch(session, cwd),
       updatedAt: Date.parse(session?.updatedAt ?? "") || 0,
     }))
     .filter((entry) => entry.score >= 0)
@@ -205,135 +164,159 @@ async function fetchJson(url, init = {}, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS) {
   }
 }
 
-function buildSystemContext({
+function buildSystemPrompt({
   session,
   snapshot,
-  cachedDiagnostics,
   diagnosticLimit,
 }) {
-  const blocks = [
+  const sections = [
     "VS Code bridge context is authoritative for the editor state the user is currently seeing.",
     `Bridge session: ${session.sessionId}`,
     `Workspace: ${session.workspaceName}`,
   ];
 
   if (!snapshot || typeof snapshot !== "object") {
-    blocks.push("Bridge snapshot was unavailable for this turn.");
-    return blocks.join("\n\n");
+    sections.push("Bridge snapshot was unavailable for this turn.");
+    return sections.join("\n\n");
   }
 
   if (snapshot.kind === "none") {
-    blocks.push("There is no active VS Code text editor right now.");
-    return blocks.join("\n\n");
+    sections.push("There is no active VS Code text editor right now.");
+    return sections.join("\n\n");
   }
 
   if (snapshot.kind === "unsupported") {
-    blocks.push(`The active VS Code editor is unsupported for bridge capture: ${snapshot.editorType}.`);
-    return blocks.join("\n\n");
+    sections.push(`The active VS Code editor is unsupported for bridge capture: ${snapshot.editorType}.`);
+    return sections.join("\n\n");
   }
 
-  blocks.push(
+  sections.push(
     [
       `Document: ${snapshot.document.uri}`,
       `Language: ${snapshot.document.languageId}`,
       `Dirty: ${snapshot.document.isDirty ? "yes" : "no"}`,
       `Untitled: ${snapshot.document.isUntitled ? "yes" : "no"}`,
-      `Primary selection: ${formatSelections(snapshot)}`,
+      `Primary selection: ${formatSelection(snapshot)}`,
     ].join("\n")
   );
 
-  blocks.push(`Current document diagnostics\n${summarizeDiagnostics(snapshot.diagnostics, diagnosticLimit)}`);
-
-  if (cachedDiagnostics) {
-    blocks.push(`Recent OpenCode LSP diagnostics\n${cachedDiagnostics}`);
-  }
-
-  blocks.push(
+  sections.push(`Current document diagnostics\n${summarizeDiagnostics(snapshot.diagnostics, diagnosticLimit)}`);
+  sections.push(
     "Use this snapshot for viewport, cursor, selection, and current diagnostics. If filesystem contents disagree, prefer the VS Code snapshot for what the user is actively looking at."
   );
 
-  return blocks.join("\n\n");
+  return sections.join("\n\n");
 }
 
-export const AgentBridgePlugin = async ({ directory, worktree }) => {
+async function describeConnection({ cwd, bridgeHome }) {
+  const session = await resolveSession({ cwd, bridgeHome });
+  if (!session) {
+    return {
+      session: null,
+      message: "No matching VS Code bridge session found for the current Pi working directory.",
+    };
+  }
+
+  const health = await fetchJson(`${session.endpoint}/v1/health`);
+  if (!health.ok || health.data?.status !== "ok") {
+    return {
+      session,
+      message: `Matched VS Code bridge session "${session.workspaceName}", but it is not currently healthy.`,
+    };
+  }
+
+  return {
+    session,
+    message: `Connected to VS Code bridge workspace "${session.workspaceName}" (${session.sessionId}).`,
+  };
+}
+
+export default function agentBridgePiExtension(pi) {
   const bridgeHome = process.env.AGENT_BRIDGE_HOME || DEFAULT_BRIDGE_HOME;
   const diagnosticLimit = toPositiveInt(
     process.env.AGENT_BRIDGE_DIAGNOSTIC_LIMIT,
     DEFAULT_DIAGNOSTIC_LIMIT
   );
 
-  async function getMatchedSession() {
-    return resolveSession({
-      directory,
-      worktree,
-      bridgeHome,
-    });
-  }
-
-  return {
-    event: async ({ event }) => {
-      if (event?.type !== "lsp.client.diagnostics") {
-        return;
-      }
-
-      const sessionID = getEventSessionId(event);
-      if (!sessionID) {
-        return;
-      }
-
-      const diagnostics = extractDiagnosticsFromEvent(event);
-      lspDiagnosticsCache.set(sessionID, summarizeDiagnostics(diagnostics, diagnosticLimit));
-    },
-
-    "shell.env": async (input, output) => {
-      const session = await resolveSession({
-        directory: input.cwd || directory,
-        worktree,
+  pi.registerCommand("bridge-status", {
+    description: "Show the current VS Code Agent Bridge connection status",
+    handler: async (_args, ctx) => {
+      const { message } = await describeConnection({
+        cwd: ctx.cwd,
         bridgeHome,
       });
 
-      if (!session) {
-        return;
+      if (ctx.hasUI) {
+        ctx.ui.notify(message, "info");
       }
-
-      output.env.AGENT_BRIDGE_HOME = bridgeHome;
-      output.env.AGENT_BRIDGE_SESSION_ID = session.sessionId;
-      output.env.AGENT_BRIDGE_WORKSPACE = session.workspaceName;
-      output.env.AGENT_BRIDGE_ENDPOINT = session.endpoint;
-      output.env.AGENT_BRIDGE_TOKEN = session.token;
     },
+  });
 
-    "experimental.chat.system.transform": async (input, output) => {
-      const session = await getMatchedSession();
-      if (!session) {
-        return;
-      }
+  pi.on("session_start", async (_event, ctx) => {
+    if (!ctx.hasUI) {
+      return;
+    }
 
-      const health = await fetchJson(`${session.endpoint}/v1/health`);
-      if (!health.ok || health.data?.status !== "ok") {
-        return;
-      }
+    const { session } = await describeConnection({
+      cwd: ctx.cwd,
+      bridgeHome,
+    });
 
-      const snapshotResponse = await fetchJson(`${session.endpoint}/v1/context/active-editor`, {
-        headers: {
-          Authorization: `Bearer ${session.token}`,
-        },
-      });
+    ctx.ui.setStatus(
+      "agent-bridge",
+      session ? "Bridge" : "Bridge unavailable"
+    );
+  });
 
-      if (!snapshotResponse.ok || !snapshotResponse.data?.snapshot) {
-        return;
-      }
+  pi.on("session_switch", async (_event, ctx) => {
+    if (!ctx.hasUI) {
+      return;
+    }
 
-      const injected = buildSystemContext({
-        session,
-        snapshot: snapshotResponse.data.snapshot,
-        cachedDiagnostics: lspDiagnosticsCache.get(input.sessionID),
-        diagnosticLimit,
-      });
+    const { session } = await describeConnection({
+      cwd: ctx.cwd,
+      bridgeHome,
+    });
 
-      output.system.push(injected);
-    },
-  };
-};
+    ctx.ui.setStatus(
+      "agent-bridge",
+      session ? "Bridge" : "Bridge unavailable"
+    );
+  });
 
-export default AgentBridgePlugin;
+  pi.on("before_agent_start", async (event, ctx) => {
+    const session = await resolveSession({
+      cwd: ctx.cwd,
+      bridgeHome,
+    });
+
+    if (!session) {
+      return undefined;
+    }
+
+    const health = await fetchJson(`${session.endpoint}/v1/health`);
+    if (!health.ok || health.data?.status !== "ok") {
+      return undefined;
+    }
+
+    const snapshotResponse = await fetchJson(`${session.endpoint}/v1/context/active-editor`, {
+      headers: {
+        Authorization: `Bearer ${session.token}`,
+      },
+    });
+
+    if (!snapshotResponse.ok || !snapshotResponse.data?.snapshot) {
+      return undefined;
+    }
+
+    const injected = buildSystemPrompt({
+      session,
+      snapshot: snapshotResponse.data.snapshot,
+      diagnosticLimit,
+    });
+
+    return {
+      systemPrompt: `${event.systemPrompt}\n\n${injected}`,
+    };
+  });
+}
