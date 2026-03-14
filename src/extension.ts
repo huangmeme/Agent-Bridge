@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { SessionManager } from './session/manager';
 import { HttpServer } from './http/server';
-import { getSessionFilePath } from './session/file';
+import { cleanupOrphanedSessionFiles, getSessionFilePath } from './session/file';
 
 let sessionManager: SessionManager;
 let httpServer: HttpServer;
@@ -30,81 +30,35 @@ export function getTargetWorkspaceFromActiveEditor(
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  cleanupOrphanedSessionFiles();
+
   sessionManager = new SessionManager();
   httpServer = new HttpServer(sessionManager);
 
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-  statusBarItem.command = 'agentBridge.enableWorkspace';
   updateStatusBar();
-  statusBarItem.show();
 
   const enableWorkspaceCmd = vscode.commands.registerCommand(
     'agentBridge.enableWorkspace',
     async () => {
-      const workspaceFolders = vscode.workspace.workspaceFolders;
-      if (!workspaceFolders || workspaceFolders.length === 0) {
-        vscode.window.showErrorMessage('No workspace folder open');
-        return;
-      }
-
-      let targetWorkspace = getTargetWorkspaceFromActiveEditor(
-        workspaceFolders,
-        vscode.window.activeTextEditor
-      );
-
-      if (!targetWorkspace) {
-        const picks = workspaceFolders.map(f => ({
-          label: f.name,
-          description: f.uri.fsPath,
-          folder: f,
-        }));
-        const selected = await vscode.window.showQuickPick(picks, {
-          placeHolder: 'Select workspace folder to enable',
-        });
-        if (!selected) {
-          return;
-        }
-        targetWorkspace = selected.folder;
-      }
-
-      const confirm = await vscode.window.showInformationMessage(
-        `Enable Agent Bridge for workspace "${targetWorkspace.name}"?`,
-        'Yes',
-        'No'
-      );
-
-      if (confirm !== 'Yes') {
-        return;
-      }
-
-      try {
-        if (!httpServer.isRunning) {
-          const port = await httpServer.start();
-          console.log(`HTTP server started on port ${port}`);
-        }
-
-        await sessionManager.enable(targetWorkspace, httpServer.currentPort);
-        updateStatusBar();
-
-        const sessionPath = getSessionFilePath(sessionManager.sessionId!);
-        vscode.window.showInformationMessage(
-          `Agent Bridge enabled. Session file: ${sessionPath}`
-        );
-      } catch (err) {
-        vscode.window.showErrorMessage(`Failed to enable Agent Bridge: ${err}`);
-      }
+      await enableBridge(true);
     }
   );
 
   const disableWorkspaceCmd = vscode.commands.registerCommand(
     'agentBridge.disableWorkspace',
     async () => {
-      try {
-        await sessionManager.disable();
-        updateStatusBar();
-        vscode.window.showInformationMessage('Agent Bridge disabled');
-      } catch (err) {
-        vscode.window.showErrorMessage(`Failed to disable Agent Bridge: ${err}`);
+      await disableBridge(true);
+    }
+  );
+
+  const toggleWorkspaceCmd = vscode.commands.registerCommand(
+    'agentBridge.toggleWorkspace',
+    async () => {
+      if (sessionManager.isEnabled) {
+        await disableBridge(true);
+      } else {
+        await enableBridge(true);
       }
     }
   );
@@ -127,6 +81,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(
     enableWorkspaceCmd,
     disableWorkspaceCmd,
+    toggleWorkspaceCmd,
     copySessionFilePathCmd,
     statusBarItem,
     {
@@ -137,21 +92,112 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   );
 
-  vscode.window.onDidChangeActiveTextEditor(() => {
-    updateStatusBar();
-  });
+  context.subscriptions.push(
+    vscode.window.onDidChangeActiveTextEditor(() => {
+      updateStatusBar();
+    }),
+    vscode.workspace.onDidChangeWorkspaceFolders(async () => {
+      if (!sessionManager.isEnabled) {
+        await enableBridge(false);
+      } else {
+        updateStatusBar();
+      }
+    })
+  );
+
+  await enableBridge(false);
 }
 
 function updateStatusBar(): void {
   if (!sessionManager.isEnabled) {
-    statusBarItem.text = '$(plug) Agent Bridge: Disabled';
-    statusBarItem.tooltip = 'Click to enable Agent Bridge';
-  } else if (!vscode.window.activeTextEditor) {
-    statusBarItem.text = '$(plug) Agent Bridge: No Active Editor';
-    statusBarItem.tooltip = 'Agent Bridge is enabled';
+    statusBarItem.text = '$(circle-slash) Bridge';
+    statusBarItem.tooltip = 'Agent Bridge is disabled. Click to enable.';
+    statusBarItem.command = 'agentBridge.toggleWorkspace';
+    statusBarItem.show();
   } else {
-    statusBarItem.text = '$(check) Agent Bridge: Enabled';
-    statusBarItem.tooltip = `Session: ${sessionManager.sessionId}`;
+    statusBarItem.text = 'Bridge';
+    statusBarItem.tooltip = `Agent Bridge is enabled. Click to disable.\nSession: ${sessionManager.sessionId}`;
+    statusBarItem.command = 'agentBridge.toggleWorkspace';
+    statusBarItem.show();
+  }
+}
+
+async function ensureServerRunning(): Promise<void> {
+  if (!httpServer.isRunning) {
+    const port = await httpServer.start();
+    console.log(`HTTP server started on port ${port}`);
+  }
+}
+
+async function resolveTargetWorkspace(
+  interactive: boolean
+): Promise<vscode.WorkspaceFolder | undefined> {
+  const workspaceFolders = vscode.workspace.workspaceFolders;
+  if (!workspaceFolders || workspaceFolders.length === 0) {
+    if (interactive) {
+      vscode.window.showErrorMessage('No workspace folder open');
+    }
+    return undefined;
+  }
+
+  const targetWorkspace = getTargetWorkspaceFromActiveEditor(
+    workspaceFolders,
+    vscode.window.activeTextEditor
+  );
+
+  if (targetWorkspace) {
+    return targetWorkspace;
+  }
+
+  if (!interactive) {
+    return workspaceFolders[0];
+  }
+
+  const picks = workspaceFolders.map(f => ({
+    label: f.name,
+    description: f.uri.fsPath,
+    folder: f,
+  }));
+  const selected = await vscode.window.showQuickPick(picks, {
+    placeHolder: 'Select workspace folder to enable',
+  });
+  return selected?.folder;
+}
+
+async function enableBridge(showMessage: boolean): Promise<void> {
+  try {
+    const targetWorkspace = await resolveTargetWorkspace(showMessage);
+    if (!targetWorkspace) {
+      updateStatusBar();
+      return;
+    }
+
+    await ensureServerRunning();
+    await sessionManager.enable(targetWorkspace, httpServer.currentPort);
+    updateStatusBar();
+
+    if (showMessage) {
+      const sessionPath = getSessionFilePath(sessionManager.sessionId!);
+      vscode.window.showInformationMessage(
+        `Agent Bridge enabled. Session file: ${sessionPath}`
+      );
+    }
+  } catch (err) {
+    updateStatusBar();
+    vscode.window.showErrorMessage(`Failed to enable Agent Bridge: ${err}`);
+  }
+}
+
+async function disableBridge(showMessage: boolean): Promise<void> {
+  try {
+    await sessionManager.disable();
+    updateStatusBar();
+
+    if (showMessage) {
+      vscode.window.showInformationMessage('Agent Bridge disabled');
+    }
+  } catch (err) {
+    vscode.window.showErrorMessage(`Failed to disable Agent Bridge: ${err}`);
   }
 }
 
